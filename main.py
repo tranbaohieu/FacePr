@@ -4,22 +4,28 @@ import matplotlib.pyplot as plt
 import cv2
 from imageio import imread
 from scipy.spatial import distance
-from keras.models import load_model
+import torch 
+from torchvision import transforms
+from facenet_pytorch import InceptionResnetV1, fixed_image_standardization
+
 import pandas as pd
 from tqdm import tqdm
 import dlib
-from model import create_model
 from align import AlignDlib
 import glob
 import imutils
 
 
 # INITIALIZE MODELS
-nn4_small2 = create_model()
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(device)
 
-nn4_small2.summary()
+nn4_small2 = InceptionResnetV1(
+    classify=False,
+    pretrained="casia-webface"
+).to(device)
 
-nn4_small2.load_weights('weights/nn4.small2.v1.h5')
+nn4_small2.eval()
 
 alignment = AlignDlib('shape_predictor_68_face_landmarks.dat')
 
@@ -32,7 +38,7 @@ nb_classes = len(train_paths)
 df_train = pd.DataFrame(columns=['image', 'label', 'name'])
 
 for i,train_path in enumerate(train_paths):
-    name = train_path.split("/")[-1]
+    name = os.path.basename(train_path)
     images = glob.glob(train_path + "/*")
     for image in images:
         df_train.loc[len(df_train)]=[image,i,name]
@@ -45,11 +51,10 @@ def l2_normalize(x, axis=-1, epsilon=1e-10):
     return output
 
 def align_face(face):
-    #print(img.shape)
     (h,w,c) = face.shape
     bb = dlib.rectangle(0, 0, w, h)
-    #print(bb)
-    return alignment.align(96, face, bb,landmarkIndices=AlignDlib.OUTER_EYES_AND_NOSE)
+    aligned_face = alignment.align(96, face, bb,landmarkIndices=AlignDlib.OUTER_EYES_AND_NOSE)
+    return aligned_face
   
 def load_and_align_images(filepaths):
     aligned_images = []
@@ -58,20 +63,23 @@ def load_and_align_images(filepaths):
         img = cv2.imread(filepath)
         aligned = align_face(img)
         aligned = (aligned / 255.).astype(np.float32)
+        aligned = aligned.transpose((2, 0, 1))
         aligned = np.expand_dims(aligned, axis=0)
         aligned_images.append(aligned)
             
     return np.array(aligned_images)
     
-def calc_embs(filepaths, batch_size=64): 
+def calc_embs(filepaths, batch_size=2): 
     pd = []
     for start in tqdm(range(0, len(filepaths), batch_size)):
         aligned_images = load_and_align_images(filepaths[start:start+batch_size])
-        pd.append(nn4_small2.predict_on_batch(np.squeeze(aligned_images)))
+        aligned_images = torch.from_numpy(aligned_images).squeeze(1)
+        emb = nn4_small2(aligned_images).detach().numpy()
+        pd.append(emb)
     #embs = l2_normalize(np.concatenate(pd))
-    embs = np.array(pd)
+    embs = np.concatenate(pd, axis=0)
 
-    return np.array(embs)
+    return embs
     
 def align_faces(faces):
     aligned_images = []
@@ -79,7 +87,7 @@ def align_faces(faces):
         #print(face.shape)
         aligned = align_face(face)
         aligned = (aligned / 255.).astype(np.float32)
-        aligned = np.expand_dims(aligned, axis=0)
+        aligned = aligned.transpose((2, 0, 1))
         aligned_images.append(aligned)
         
     return aligned_images
@@ -87,13 +95,24 @@ def align_faces(faces):
 def calc_emb_test(faces):
     pd = []
     aligned_faces = align_faces(faces)
-    if(len(faces)==1):
-        pd.append(nn4_small2.predict_on_batch(aligned_faces))
-    elif(len(faces)>1):
-        pd.append(nn4_small2.predict_on_batch(np.squeeze(aligned_faces)))
+    aligned_faces = np.array(aligned_faces)
+    aligned_faces = torch.from_numpy(aligned_faces)
+    pd.append(nn4_small2(aligned_faces).detach().numpy())
     #embs = l2_normalize(np.concatenate(pd))
-    embs = np.array(pd)
+    embs = np.concatenate(pd, axis=0)
     return np.array(embs)
+
+def trans(img):
+    transform = transforms.Compose([
+            transforms.ToTensor(),
+            fixed_image_standardization
+        ])
+    return transform(img)
+
+def fixed_image_standardization(image_tensor):
+    processed_tensor = (image_tensor - 127.5) / 128.0
+    return processed_tensor
+
 
 # TRAINING
 label2idx = []
@@ -101,10 +120,9 @@ label2idx = []
 for i in tqdm(range(len(train_paths))):
     label2idx.append(np.asarray(df_train[df_train.label == i].index))
 
-train_embs = calc_embs(df_train.image)
-np.save("train_embs.npy", train_embs)
-
-train_embs = np.concatenate(train_embs)
+# train_embs = calc_embs(df_train.image)
+# np.save("train_embs.npy", train_embs)
+train_embs = np.load("train_embs.npy")
 
 # ANALYSING
 import matplotlib.pyplot as plt
@@ -162,8 +180,6 @@ for path in test_paths:
         continue
     else:    
         test_embs = calc_emb_test(faces)
-
-    test_embs = np.concatenate(test_embs)
         
     people = []
     for i in range(test_embs.shape[0]):
@@ -195,7 +211,7 @@ for path in test_paths:
         x2 = faceRect.right()
         y2 = faceRect.bottom()
         cv2.rectangle(show_image,(x1,y1),(x2,y2),(255,0,0),3)
-        cv2.putText(show_image,names[i],(x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 2,(255,0,0),3,cv2.LINE_AA)
+        cv2.putText(show_image,names[i],(x1,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 2,(255,0,0),2,cv2.LINE_AA)
         
 
     show_image = imutils.resize(show_image,width = 720)   

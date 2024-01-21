@@ -185,4 +185,4 @@ class AlignDlib:
                                    imgDim * MINMAX_TEMPLATE[npLandmarkIndices])
         thumbnail = cv2.warpAffine(rgbImg, H, (imgDim, imgDim))
 
-        return thumbnail
+        return thumbnail, npLandmarks
