@@ -7,6 +7,7 @@ from scipy.spatial import distance
 import torch 
 from torchvision import transforms
 from facenet_pytorch import InceptionResnetV1, fixed_image_standardization
+from facenet_pytorch import MTCNN
 
 import pandas as pd
 from tqdm import tqdm
@@ -27,7 +28,10 @@ nn4_small2 = InceptionResnetV1(
 
 nn4_small2.eval()
 
-alignment = AlignDlib('shape_predictor_68_face_landmarks.dat')
+alignment = AlignDlib('weights/shape_predictor_68_face_landmarks.dat')
+
+mtcnn = MTCNN(thresholds= [0.7, 0.7, 0.8] ,keep_all=True, device = device)
+hogFaceDetector = dlib.get_frontal_face_detector()
 
 #LOAD TRAINING INFORMATION
 train_paths = glob.glob("image/*")
@@ -53,15 +57,15 @@ def l2_normalize(x, axis=-1, epsilon=1e-10):
 def align_face(face):
     (h,w,c) = face.shape
     bb = dlib.rectangle(0, 0, w, h)
-    aligned_face = alignment.align(96, face, bb,landmarkIndices=AlignDlib.OUTER_EYES_AND_NOSE)
-    return aligned_face
+    aligned_face, npLandmarks = alignment.align(96, face, bb,landmarkIndices=AlignDlib.OUTER_EYES_AND_NOSE)
+    return aligned_face, npLandmarks
   
 def load_and_align_images(filepaths):
     aligned_images = []
     for filepath in filepaths:
         #print(filepath)
         img = cv2.imread(filepath)
-        aligned = align_face(img)
+        aligned, _ = align_face(img)
         aligned = (aligned / 255.).astype(np.float32)
         aligned = aligned.transpose((2, 0, 1))
         aligned = np.expand_dims(aligned, axis=0)
@@ -83,24 +87,26 @@ def calc_embs(filepaths, batch_size=2):
     
 def align_faces(faces):
     aligned_images = []
+    landmarks_of_face_list = []
     for face in faces:
         #print(face.shape)
-        aligned = align_face(face)
+        aligned, npLandmarks = align_face(face)
         aligned = (aligned / 255.).astype(np.float32)
         aligned = aligned.transpose((2, 0, 1))
         aligned_images.append(aligned)
+        landmarks_of_face_list.append(npLandmarks)
         
-    return aligned_images
+    return aligned_images, landmarks_of_face_list
 
 def calc_emb_test(faces):
     pd = []
-    aligned_faces = align_faces(faces)
+    aligned_faces, landmarks_of_face_list = align_faces(faces)
     aligned_faces = np.array(aligned_faces)
     aligned_faces = torch.from_numpy(aligned_faces)
     pd.append(nn4_small2(aligned_faces).detach().numpy())
     #embs = l2_normalize(np.concatenate(pd))
     embs = np.concatenate(pd, axis=0)
-    return np.array(embs)
+    return np.array(embs), landmarks_of_face_list
 
 def trans(img):
     transform = transforms.Compose([
@@ -113,6 +119,29 @@ def fixed_image_standardization(image_tensor):
     processed_tensor = (image_tensor - 127.5) / 128.0
     return processed_tensor
 
+def mtcnn_detect(image):
+    boxes, _ = mtcnn.detect(image)
+    faces = []
+    if boxes is not None:
+        for box in boxes:
+            bbox = list(map(int,box.tolist()))
+            faces.append(image[bbox[1] : bbox[3], bbox[0] : bbox[2]])
+    return boxes, faces
+
+def hog_svm_detect(image):
+    faceRects = hogFaceDetector(image, 0)
+    boxes = []
+    faces = []
+    
+    for faceRect in faceRects:
+        x1 = faceRect.left()
+        y1 = faceRect.top()
+        x2 = faceRect.right()
+        y2 = faceRect.bottom()
+        faces.append(image[y1 : y2, x1 : x2])
+        boxes.append(np.array([x1, y1, x2, y2]))
+    return boxes, faces
+
 
 # TRAINING
 label2idx = []
@@ -120,9 +149,9 @@ label2idx = []
 for i in tqdm(range(len(train_paths))):
     label2idx.append(np.asarray(df_train[df_train.label == i].index))
 
-# train_embs = calc_embs(df_train.image)
-# np.save("train_embs.npy", train_embs)
-train_embs = np.load("train_embs.npy")
+train_embs = calc_embs(df_train.image)
+np.save("train_embs.npy", train_embs)
+# train_embs = np.load("train_embs.npy")
 
 # ANALYSING
 import matplotlib.pyplot as plt
@@ -152,15 +181,14 @@ _,_,_=plt.hist(unmatch_distances,bins=100,fc=(1, 0, 0, 0.5))
 
 plt.show()
 
-threshold = 1
+threshold = 0.9
 
 # TEST
 test_paths = glob.glob("test_image/*.jpg")
 for path in test_paths:
     test_image = cv2.imread(path)
     show_image = test_image.copy()
-
-    hogFaceDetector = dlib.get_frontal_face_detector()
+    
     faceRects = hogFaceDetector(test_image, 0)
     
     faces = []
@@ -179,15 +207,13 @@ for path in test_paths:
         print("no face detected!")
         continue
     else:    
-        test_embs = calc_emb_test(faces)
+        test_embs, _ = calc_emb_test(faces)
         
     people = []
     for i in range(test_embs.shape[0]):
         distances = []
         for j in range(len(train_paths)):
             distances.append(np.min([distance.euclidean(test_embs[i].reshape(-1), train_embs[k].reshape(-1)) for k in label2idx[j]]))
-            #for k in label2idx[j]:
-                #print(distance.euclidean(test_embs[i].reshape(-1), train_embs[k].reshape(-1)))
         if np.min(distances)>threshold:
             people.append("unknown")
         else:

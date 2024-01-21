@@ -94,12 +94,12 @@ def fixed_image_standardization(image_tensor):
     return processed_tensor
 
 def mtcnn_detect(image):
-    boxes, _ = mtcnn.detect(frame)
+    boxes, _ = mtcnn.detect(image)
     faces = []
     if boxes is not None:
         for box in boxes:
             bbox = list(map(int,box.tolist()))
-            faces.append(frame[bbox[1] : bbox[3], bbox[0] : bbox[2]])
+            faces.append(image[bbox[1] : bbox[3], bbox[0] : bbox[2]])
     return boxes, faces
 
 def hog_svm_detect(image):
